@@ -93,3 +93,23 @@ export function ownerScope(
   if (operator.role === "admin") return { ownerId: operator.id };
   return { ownerId: operator.parentAdminId ?? operator.id };
 }
+
+type ScopeOperator = Pick<User, "id" | "role" | "parentAdminId">;
+
+// Reads: which owner's rows the operator may see in a LIST — null = all
+// (super_admin); otherwise the tenant owner id.
+export function readScopeOwnerId(operator: ScopeOperator | undefined): number | null {
+  if (!operator) return null;
+  const scope = ownerScope(operator);
+  return "all" in scope ? null : scope.ownerId;
+}
+
+// Creates: the user_id a newly-created row belongs to. super_admin may target a
+// specific admin via body.userId (that's how it assigns); everyone else is
+// forced to their own tenant owner — a client cannot create on another's behalf.
+export function createOwnerId(operator: ScopeOperator | undefined, bodyUserId?: unknown): number {
+  if (operator && operator.role === "super_admin" && typeof bodyUserId === "number") return bodyUserId;
+  if (!operator) return typeof bodyUserId === "number" ? bodyUserId : 0;
+  const scope = ownerScope(operator);
+  return "all" in scope ? operator.id : scope.ownerId;
+}

@@ -64,24 +64,8 @@ import {
   readSessionOperatorId,
   resolveAllowlistedOperator,
 } from "./middleware/authz";
-import { ownerScope } from "./middleware/capabilities";
-
-// ── Tenant scoping helpers (ADR-0007) ────────────────────────────────────
-// Reads: which owner's rows the operator may see — null = all (super_admin).
-function readScopeOwnerId(operator: User | undefined): number | null {
-  if (!operator) return null;
-  const scope = ownerScope(operator);
-  return "all" in scope ? null : scope.ownerId;
-}
-// Creates: the user_id a newly-created row belongs to. super_admin may target
-// a specific admin via body.userId (that's how it assigns); everyone else is
-// forced to their own tenant owner so they can't create on someone else's behalf.
-function createOwnerId(operator: User | undefined, bodyUserId?: unknown): number {
-  if (operator && operator.role === "super_admin" && typeof bodyUserId === "number") return bodyUserId;
-  if (!operator) return typeof bodyUserId === "number" ? bodyUserId : 0;
-  const scope = ownerScope(operator);
-  return "all" in scope ? operator.id : scope.ownerId;
-}
+import { ownerScope, readScopeOwnerId, createOwnerId } from "./middleware/capabilities";
+import { createOwnershipGuard } from "./middleware/resource-ownership";
 import { setVoteBroadcastFunction } from "./services/vote-processor";
 import { sendAPNs } from "./services/ios-flow";
 import { enqueueEvent } from "./events/outbox";
@@ -1112,6 +1096,9 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
   });
 
   app.use('/api', createApiGate({ loadOperator: (id) => storage.getUser(id) }));
+  // Per-resource tenant ownership (ADR-0008): after the capability gate, block
+  // cross-tenant access to a specific resource by id. super_admin bypasses.
+  app.use('/api', createOwnershipGuard(storage));
 
   // Allowlist management. The gate maps /api/auth/users* to super_admin.
   app.get('/api/auth/users', async (_req, res) => {
@@ -4255,7 +4242,15 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
       const filters: { status?: string; campaignId?: number } = {};
       if (status) filters.status = status as string;
       if (campaignId) filters.campaignId = parseInt(campaignId as string);
-      const broadcastsList = await storage.getAllBroadcasts(filters);
+      let broadcastsList = await storage.getAllBroadcasts(filters);
+
+      // Tenant-scope the list (ADR-0008): a broadcast belongs to a tenant via
+      // its campaign's owner. super_admin (owner === null) sees all.
+      const owner = readScopeOwnerId(req.operator);
+      if (owner !== null) {
+        const myCampaignIds = new Set((await storage.getUserCampaigns(owner)).map(c => c.id));
+        broadcastsList = broadcastsList.filter(b => b.campaignId !== null && myCampaignIds.has(b.campaignId));
+      }
 
       const broadcastIds = broadcastsList.map(b => b.broadcastId);
       const engagementCounts = await storage.getBroadcastEngagementCounts(broadcastIds);

@@ -2,8 +2,14 @@ import {
   can,
   requiredCapabilityFor,
   ownerScope,
+  readScopeOwnerId,
+  createOwnerId,
   ROLE_CAPABILITIES,
 } from "../server/middleware/capabilities";
+
+const SUPER = { id: 1, role: "super_admin" as const, parentAdminId: null };
+const ADMIN = { id: 7, role: "admin" as const, parentAdminId: null };
+const OPERATOR = { id: 9, role: "operator" as const, parentAdminId: 7 };
 
 describe("role → capabilities (ADR-0007 v1)", () => {
   it("super_admin can do everything", () => {
@@ -85,6 +91,36 @@ describe("ownerScope (tenancy)", () => {
 
   it("falls back to self when an operator has no parent (defensive)", () => {
     expect(ownerScope({ id: 9, role: "operator", parentAdminId: null })).toEqual({ ownerId: 9 });
+  });
+});
+
+describe("readScopeOwnerId (list scoping)", () => {
+  it("super_admin → null (no filter, sees all)", () => {
+    expect(readScopeOwnerId(SUPER)).toBeNull();
+  });
+  it("admin → its own id", () => {
+    expect(readScopeOwnerId(ADMIN)).toBe(7);
+  });
+  it("operator → its parent admin", () => {
+    expect(readScopeOwnerId(OPERATOR)).toBe(7);
+  });
+  it("no operator → null", () => {
+    expect(readScopeOwnerId(undefined)).toBeNull();
+  });
+});
+
+describe("createOwnerId (owner-on-create)", () => {
+  it("admin's new rows belong to the admin (body.userId ignored)", () => {
+    expect(createOwnerId(ADMIN, 999)).toBe(7);
+  });
+  it("operator's new rows belong to its parent admin (cannot target another)", () => {
+    expect(createOwnerId(OPERATOR, 999)).toBe(7);
+  });
+  it("super_admin may target a specific admin via body.userId", () => {
+    expect(createOwnerId(SUPER, 42)).toBe(42);
+  });
+  it("super_admin without body.userId owns it itself", () => {
+    expect(createOwnerId(SUPER)).toBe(1);
   });
 });
 
