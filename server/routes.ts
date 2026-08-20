@@ -499,6 +499,10 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
   const { registerAnalyticsRoutes } = await import("./analytics");
   registerAnalyticsRoutes(app);
 
+  // Vio Analytics (colector) — proxy con authz de operador para dashboards.
+  const { registerVioAnalyticsProxy } = await import("./analytics-proxy");
+  registerVioAnalyticsProxy(app, { storage });
+
   // Create WebSocket server with noServer mode for custom path handling
   const wss = new WebSocketServer({ noServer: true });
 
@@ -5225,7 +5229,14 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
   // SDK Endpoints (v1)
   // ========================================
 
-  // Middleware to validate API key for SDK requests
+  // Middleware to validate API key for SDK requests.
+  // TTL cache: SDK traffic hits this on EVERY request — without the cache
+  // that's one Postgres round-trip per call. 60s positive / 10s negative
+  // (so a just-created key isn't locked out long). Same pattern as the
+  // vio-analytics collector's ApiKeyResolver.
+  const apiKeyCache = new Map<string, { app: Awaited<ReturnType<typeof storage.getClientAppByApiKey>>; expiresAt: number }>();
+  const API_KEY_TTL_MS = 60_000;
+  const API_KEY_NEG_TTL_MS = 10_000;
   const validateApiKey = async (req: Request, res: any, next: any) => {
     try {
       const apiKey = req.query.apiKey as string || req.headers['x-api-key'] as string;
@@ -5234,7 +5245,23 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
         return res.status(401).json({ message: 'API key required' });
       }
 
-      const clientApp = await storage.getClientAppByApiKey(apiKey);
+      const now = Date.now();
+      const hit = apiKeyCache.get(apiKey);
+      let clientApp: Awaited<ReturnType<typeof storage.getClientAppByApiKey>>;
+      if (hit && hit.expiresAt > now) {
+        clientApp = hit.app; // fresh hit — may be a cached negative (undefined)
+      } else {
+        clientApp = await storage.getClientAppByApiKey(apiKey);
+        apiKeyCache.set(apiKey, {
+          app: clientApp,
+          expiresAt: now + (clientApp ? API_KEY_TTL_MS : API_KEY_NEG_TTL_MS),
+        });
+        if (apiKeyCache.size > 10_000) {
+          apiKeyCache.forEach((entry, key) => {
+            if (entry.expiresAt <= now) apiKeyCache.delete(key);
+          });
+        }
+      }
 
       if (!clientApp) {
         return res.status(401).json({ message: 'Invalid API key' });
