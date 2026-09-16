@@ -60,6 +60,7 @@ import { firebaseAuth, envIdTokenVerifier } from "./middleware/firebase-auth";
 import { ensureFirebaseUser, deleteFirebaseUser, isFirebaseAdminEnabled, listPendingSignups } from "./services/firebase-admin";
 import { verifyCommerceApiKey } from "./services/commerce";
 import { envCommerceProfileLookup } from "./services/commerce-account";
+import { sponsorSelfUpdateSchema } from "./services/sponsor-self";
 import {
   createApiGate,
   createSessionToken,
@@ -69,7 +70,7 @@ import {
   resolveRequestOperator,
   type ApiGateOptions,
 } from "./middleware/authz";
-import { ownerScope, readScopeOwnerId, createOwnerId } from "./middleware/capabilities";
+import { ownerScope, readScopeOwnerId, createOwnerId, accountTypeFor, featuresFor } from "./middleware/capabilities";
 import { createOwnershipGuard } from "./middleware/resource-ownership";
 import { setVoteBroadcastFunction } from "./services/vote-processor";
 import { sendAPNs } from "./services/ios-flow";
@@ -1085,6 +1086,9 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
     sponsorId: u.sponsorId,
     parentAdminId: u.parentAdminId,
     linked: Boolean(u.firebaseUid),
+    // Unified front (webapp-vio-commerce) builds its menu from these.
+    accountType: accountTypeFor(u.role),
+    features: featuresFor(u.role),
   });
 
   // Exchange a verified Firebase ID token (shared Commerce project) for a
@@ -2145,6 +2149,37 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
     } catch (error) {
       console.error('[sponsor/me] error', error);
       res.status(500).json({ message: 'Error loading sponsor' });
+    }
+  });
+
+  // The brand edits its own identity (name, logo, colors). Commerce keys and
+  // payment methods stay out of reach — those are not the brand's to type.
+
+  app.patch('/api/sponsor/me', async (req, res) => {
+    const sid = req.operator?.sponsorId ?? null;
+    if (sid == null) return res.status(403).json({ message: 'This account is not linked to a sponsor' });
+    const parsed = sponsorSelfUpdateSchema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      return res.status(400).json({ message: 'Invalid brand update', errors: parsed.error.flatten() });
+    }
+    if (Object.keys(parsed.data).length === 0) {
+      return res.status(400).json({ message: 'Nothing to update' });
+    }
+    try {
+      const s = await storage.updateSponsor(sid, parsed.data);
+      if (!s) return res.status(404).json({ message: 'Sponsor not found' });
+      res.json({
+        id: s.id,
+        name: s.name,
+        logoUrl: s.logoUrl,
+        avatarUrl: s.avatarUrl,
+        primaryColor: s.primaryColor,
+        secondaryColor: s.secondaryColor,
+        hasCommerce: Boolean(s.commerceApiKey),
+      });
+    } catch (error) {
+      console.error('[sponsor/me] update error', error);
+      res.status(500).json({ message: 'Error updating sponsor' });
     }
   });
 

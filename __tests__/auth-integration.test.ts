@@ -13,6 +13,7 @@ const OPERATORS: Record<number, any> = {
   8: { id: 8, role: "admin", parentAdminId: null },        // admin B
   9: { id: 9, role: "operator", parentAdminId: 7 },        // operator under A
   10: { id: 10, role: "viewer", parentAdminId: 7 },        // viewer under A
+  11: { id: 11, role: "sponsor", parentAdminId: null, sponsorId: 5 }, // brand
 };
 
 // campaign 100 → owner A(7); campaign 200 → owner B(8).
@@ -44,6 +45,7 @@ function buildApp() {
   app.post("/api/campaigns", (_req, res) => res.json({ created: true }));
   app.post("/api/client-apps", (_req, res) => res.json({ created: true }));
   app.get("/api/auth/users", (_req, res) => res.json({ reached: true }));
+  app.patch("/api/sponsor/me", (req, res) => res.json({ sponsorId: (req as any).operator.sponsorId }));
   return app;
 }
 
@@ -112,6 +114,16 @@ describe("auth chain — gate + ownership (integration)", () => {
     });
     it("the public bare GET is not ownership-checked, even cross-tenant", async () => {
       await request(app).get("/api/campaigns/200").set("Cookie", cookie(7)).expect(200);
+    });
+  });
+
+  describe("brand self-edit", () => {
+    it("a sponsor can PATCH its own brand", async () => {
+      const res = await request(app).patch("/api/sponsor/me").set("Cookie", cookie(11)).send({ name: "X" }).expect(200);
+      expect(res.body.sponsorId).toBe(5);
+    });
+    it("a seller (admin) cannot", async () => {
+      await request(app).patch("/api/sponsor/me").set("Cookie", cookie(7)).send({ name: "X" }).expect(403);
     });
   });
 });
