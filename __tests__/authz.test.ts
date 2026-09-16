@@ -402,7 +402,7 @@ describe("resolveOrProvisionOperator (Commerce is the only account creator)", ()
   it("falls back to Commerce when the token has no claims (supplier → sponsor, stores the Commerce id)", async () => {
     const dir = provDir();
     const lookup = jest.fn().mockResolvedValue({
-      commerceUserId: 1305, isBusiness: false, isSupplier: true, channelCount: 0, brandName: "Nytelse",
+      commerceUserId: 1305, isBusiness: false, isSupplier: true, brandName: "Nytelse",
     });
     const res = await resolveOrProvisionOperator(dir, base, "the-token", lookup);
     expect(lookup).toHaveBeenCalledWith("the-token");
@@ -412,14 +412,14 @@ describe("resolveOrProvisionOperator (Commerce is the only account creator)", ()
     );
   });
 
-  it("treats having channels in Commerce as seller", async () => {
+  it("does NOT treat a business with channels as seller (businesses connect channels too)", async () => {
     const dir = provDir();
     const lookup = jest.fn().mockResolvedValue({
-      commerceUserId: 9, isBusiness: false, isSupplier: false, channelCount: 2, brandName: null,
+      commerceUserId: 9, isBusiness: true, isSupplier: false, brandName: "Shop",
     });
     const res = await resolveOrProvisionOperator(dir, base, "tok", lookup);
-    expect(res.operator?.role).toBe("admin");
-    expect(dir.createUser).toHaveBeenCalledWith(expect.objectContaining({ reachuUserId: "9" }));
+    expect(res.operator?.role).toBe("sponsor");
+    expect(dir.createUser).not.toHaveBeenCalled();
   });
 
   it("refuses an account that is both seller and business", async () => {

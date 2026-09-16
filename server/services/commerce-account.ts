@@ -5,18 +5,21 @@
  * user on the first Firebase-bearer call from what Commerce says the account
  * is:
  *
- *   seller            (has / creates channels)        → Vio `admin`: owns its surfaces
- *   business|supplier (owns the products)             → Vio `sponsor` + its sponsor row
+ *   seller            (signed up for Channel/broadcast) → Vio `admin`: owns its surfaces
+ *   business|supplier (owns the products)               → Vio `sponsor` + its sponsor row
  *   both, or neither  → not provisioned (403)
  *
  * Two sources, cheapest first:
  *   1. The ID token's custom claims, set at signup by vio-users-microservice
- *      (`business`, `channel`, `brand_name`). Best-effort there, and the
- *      `channel` flag exists ONLY as a claim (no DB column).
+ *      (`business`, `channel`, `brand_name`). The `channel` flag exists ONLY
+ *      as a claim (no DB column); every Channel signup sends it since
+ *      2026-08-19, so it is the one and only seller signal.
  *   2. Commerce itself, with the same token, when COMMERCE_API_URL is set:
- *      `GET /api/users/me` (isBusiness, isSupplier, business) and
- *      `GET /api/channel/user` (the caller's channels — having one = seller).
- *      Covers accounts created before the claims existed.
+ *      `GET /api/users/me` (isBusiness, isSupplier, business). Covers
+ *      business/supplier accounts created before the claims existed.
+ *
+ * Having channels in Commerce does NOT mean seller: businesses connect
+ * channels too (the webapp's Channels section is for every account).
  */
 
 import type { FirebaseIdentity } from "../middleware/firebase-auth";
@@ -28,7 +31,6 @@ export interface CommerceProfile {
   commerceUserId: number | null;
   isBusiness: boolean;
   isSupplier: boolean;
-  channelCount: number;
   brandName: string | null;
 }
 
@@ -36,7 +38,7 @@ export type CommerceProfileLookup = (idToken: string) => Promise<CommerceProfile
 
 export function accountKind(identity: FirebaseIdentity, profile: CommerceProfile | null): CommerceAccountKind {
   const claims = identity.claims ?? {};
-  const seller = claims.channel === true || (profile?.channelCount ?? 0) > 0;
+  const seller = claims.channel === true;
   const business = claims.business === true || profile?.isBusiness === true || profile?.isSupplier === true;
   if (seller && business) return "both";
   if (seller) return "seller";
@@ -76,16 +78,12 @@ export function createCommerceProfileLookup(opts: {
 
   return async (idToken) => {
     try {
-      const [me, channels] = await Promise.all([
-        getJson(`${base}/api/users/me`, idToken, doFetch, timeoutMs) as Promise<Record<string, any>>,
-        getJson(`${base}/api/channel/user`, idToken, doFetch, timeoutMs),
-      ]);
+      const me = (await getJson(`${base}/api/users/me`, idToken, doFetch, timeoutMs)) as Record<string, any>;
       const id = Number(me?.id);
       return {
         commerceUserId: Number.isInteger(id) && id > 0 ? id : null,
         isBusiness: me?.isBusiness === true,
         isSupplier: me?.isSupplier === true,
-        channelCount: Array.isArray(channels) ? channels.length : 0,
         brandName:
           (typeof me?.brandName === "string" && me.brandName) ||
           (typeof me?.business?.businessName === "string" && me.business.businessName) ||
