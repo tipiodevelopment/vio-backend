@@ -3,6 +3,7 @@ import jwt from "jsonwebtoken";
 import type { User } from "@shared/schema";
 import { readBearerToken, type FirebaseIdentity, type IdTokenVerifier } from "./firebase-auth";
 import { can, requiredCapabilityFor, type Role } from "./capabilities";
+import { accountKind, brandNameFor, type CommerceProfileLookup } from "../services/commerce-account";
 
 // Operator sessions (ADR-0007, F2/F3).
 //
@@ -75,7 +76,25 @@ export interface OperatorDirectory {
   getUserByFirebaseUid(uid: string): Promise<User | undefined>;
   getUserByEmailInsensitive(email: string): Promise<User | undefined>;
   updateUser(id: number, data: Partial<{ firebaseUid: string; name: string | null }>): Promise<User | undefined>;
-  createUser(data: { email: string; name?: string | null; firebaseUid: string; role: Role }): Promise<User>;
+  createUser(data: {
+    email: string | null;
+    name?: string | null;
+    firebaseUid: string;
+    role: Role;
+    reachuUserId?: string | null;
+  }): Promise<User>;
+}
+
+/** What auto-provisioning needs on top of the allowlist lookups. */
+export interface ProvisioningDirectory extends OperatorDirectory {
+  /** User (role `sponsor`) + its sponsor row, atomically. */
+  createBusinessOperator(data: {
+    email: string | null;
+    name: string | null;
+    firebaseUid: string;
+    reachuUserId: string | null;
+    sponsorName: string;
+  }): Promise<User>;
 }
 
 function bootstrapAdminEmails(): string[] {
@@ -91,6 +110,10 @@ function bootstrapAdminEmails(): string[] {
  * firebase_uid, then email (linking the uid on first login). The only
  * exception is ADMIN_EMAILS — bootstrap so the first super_admin can
  * provision everyone else without touching SQL.
+ *
+ * Linking by email and the ADMIN_EMAILS bootstrap both require a VERIFIED
+ * email (2026-09-16): Commerce signup is open, so an unverified token could
+ * otherwise claim a provisioned email that has no Firebase account yet.
  */
 export async function resolveAllowlistedOperator(
   dir: OperatorDirectory,
@@ -100,7 +123,7 @@ export async function resolveAllowlistedOperator(
   if (byUid) return byUid;
 
   const email = identity.email?.toLowerCase();
-  if (!email) return null;
+  if (!email || identity.emailVerified !== true) return null;
 
   const byEmail = await dir.getUserByEmailInsensitive(email);
   if (byEmail) {
@@ -126,6 +149,76 @@ export async function resolveAllowlistedOperator(
 
   return null;
 }
+
+// ── Auto-provisioning from Commerce (2026-09-16) ─────────────────────────
+
+export type ProvisionResult =
+  | { operator: User; provisioned: boolean }
+  | { operator: null; reason: "email-conflict" | "both" | "none" | "conflict" };
+
+function isUniqueViolation(err: unknown): boolean {
+  return (err as { code?: string } | null)?.code === "23505";
+}
+
+/**
+ * Commerce is the only place that creates accounts. Known users resolve as
+ * in the allowlist; an unknown Commerce account gets its Vio user on the
+ * spot — seller → `admin` (owns its surfaces), business/supplier →
+ * `sponsor` + its sponsor row. Accounts that are both, or neither, are not
+ * provisioned. Concurrent first calls are safe: the unique firebase_uid makes
+ * the loser re-read the winner's row.
+ */
+export async function resolveOrProvisionOperator(
+  dir: ProvisioningDirectory,
+  identity: FirebaseIdentity,
+  idToken: string,
+  lookupProfile?: CommerceProfileLookup,
+): Promise<ProvisionResult> {
+  const known = await resolveAllowlistedOperator(dir, identity);
+  if (known) return { operator: known, provisioned: false };
+
+  // A row with this email that we could not link (unverified email, or
+  // linked to another uid) must not get a silent duplicate.
+  if (identity.email && (await dir.getUserByEmailInsensitive(identity.email.toLowerCase()))) {
+    return { operator: null, reason: "email-conflict" };
+  }
+
+  const profile = lookupProfile ? await lookupProfile(idToken) : null;
+  const kind = accountKind(identity, profile);
+  if (kind === "both" || kind === "none") return { operator: null, reason: kind };
+
+  const email = identity.email?.toLowerCase() ?? null;
+  const name = identity.name ?? null;
+  const reachuUserId = profile?.commerceUserId != null ? String(profile.commerceUserId) : null;
+
+  try {
+    const operator =
+      kind === "seller"
+        ? await dir.createUser({ email, name, firebaseUid: identity.uid, role: "admin", reachuUserId })
+        : await dir.createBusinessOperator({
+            email,
+            name,
+            firebaseUid: identity.uid,
+            reachuUserId,
+            sponsorName: brandNameFor(identity, profile),
+          });
+    console.info(`[authz] provisioned ${kind} uid=${identity.uid} as user ${operator.id} (${operator.role})`);
+    return { operator, provisioned: true };
+  } catch (err) {
+    if (!isUniqueViolation(err)) throw err;
+    const winner = await dir.getUserByFirebaseUid(identity.uid);
+    if (winner) return { operator: winner, provisioned: false };
+    console.warn(`[authz] provisioning conflict for uid=${identity.uid}:`, (err as Error).message);
+    return { operator: null, reason: "conflict" };
+  }
+}
+
+const NOT_PROVISIONED_MESSAGE: Record<"email-conflict" | "both" | "none" | "conflict", string> = {
+  "email-conflict": "This email is already registered in Vio under another login — contact support",
+  both: "This Commerce account is both a seller and a business — contact support",
+  none: "Only Commerce sellers and businesses can use Vio",
+  conflict: "Account could not be provisioned — contact support",
+};
 
 // ── Route policy ─────────────────────────────────────────────────────────
 
@@ -155,7 +248,12 @@ export interface ApiGateOptions {
    * `Authorization: Bearer <Firebase ID token>` resolved through the same
    * strict allowlist as the session login. Omitted → cookie only.
    */
-  bearer?: { verify: IdTokenVerifier; directory: OperatorDirectory };
+  bearer?: {
+    verify: IdTokenVerifier;
+    directory: OperatorDirectory;
+    /** Create unknown Commerce accounts on the spot (needs a ProvisioningDirectory). */
+    autoProvision?: { directory: ProvisioningDirectory; lookupProfile?: CommerceProfileLookup };
+  };
 }
 
 export type OperatorResolution =
@@ -182,6 +280,12 @@ export async function resolveRequestOperator(req: Request, opts: ApiGateOptions)
       identity = await opts.bearer.verify(token);
     } catch {
       return { ok: false, status: 401, message: "Invalid or expired Firebase ID token" };
+    }
+    const auto = opts.bearer.autoProvision;
+    if (auto) {
+      const result = await resolveOrProvisionOperator(auto.directory, identity, token, auto.lookupProfile);
+      if (!result.operator) return { ok: false, status: 403, message: NOT_PROVISIONED_MESSAGE[result.reason] };
+      return { ok: true, operator: result.operator, via: "bearer" };
     }
     const operator = await resolveAllowlistedOperator(opts.bearer.directory, identity);
     if (!operator) return { ok: false, status: 403, message: "Account is not provisioned for this dashboard" };

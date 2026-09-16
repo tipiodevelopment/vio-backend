@@ -114,6 +114,9 @@ export const sponsors = pgTable("sponsors", {
   secondaryColor: varchar("secondary_color", { length: 20 }),
   commerceApiKey: text("commerce_api_key"),
   commerceChannelId: text("commerce_channel_id"),
+  /** Firebase uid of the Commerce business/supplier this sponsor was created
+   *  from (auto-provisioning). Null for sponsors an admin created by hand. */
+  commerceUserUid: varchar("commerce_user_uid", { length: 128 }).unique(),
   /** Payment methods supported by this sponsor's Commerce tenant.
    *  Initial value set manually; later updates arrive via Commerce → Vio webhook.
    *  Examples: ['card', 'klarna', 'vipps', 'apple_pay', 'google_pay']. */

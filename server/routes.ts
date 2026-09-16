@@ -59,6 +59,7 @@ import { validateBroadcastId } from "./middleware/broadcast-validator";
 import { firebaseAuth, envIdTokenVerifier } from "./middleware/firebase-auth";
 import { ensureFirebaseUser, deleteFirebaseUser, isFirebaseAdminEnabled, listPendingSignups } from "./services/firebase-admin";
 import { verifyCommerceApiKey } from "./services/commerce";
+import { envCommerceProfileLookup } from "./services/commerce-account";
 import {
   createApiGate,
   createSessionToken,
@@ -1112,7 +1113,14 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
   const idTokenVerifier = envIdTokenVerifier();
   const gateOptions: ApiGateOptions = {
     loadOperator: (id) => storage.getUser(id),
-    bearer: idTokenVerifier ? { verify: idTokenVerifier, directory: storage } : undefined,
+    bearer: idTokenVerifier
+      ? {
+          verify: idTokenVerifier,
+          directory: storage,
+          // Commerce is the only place that creates accounts (2026-09-16).
+          autoProvision: { directory: storage, lookupProfile: envCommerceProfileLookup() ?? undefined },
+        }
+      : undefined,
   };
 
   app.get('/api/auth/me', async (req, res) => {

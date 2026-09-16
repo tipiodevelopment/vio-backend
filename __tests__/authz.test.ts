@@ -7,6 +7,7 @@ import {
   readSessionOperatorId,
   resolveAllowlistedOperator,
   resolveRequestOperator,
+  resolveOrProvisionOperator,
 } from "../server/middleware/authz";
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || "test-secret";
@@ -80,7 +81,7 @@ describe("session token", () => {
 });
 
 describe("resolveAllowlistedOperator (strict allowlist)", () => {
-  const identity = { uid: "uid-1", email: "Ops@vio.live", name: "Ops" };
+  const identity = { uid: "uid-1", email: "Ops@vio.live", name: "Ops", emailVerified: true };
 
   it("returns the user matched by firebase uid", async () => {
     const user = fakeUser({ firebaseUid: "uid-1" });
@@ -126,6 +127,35 @@ describe("resolveAllowlistedOperator (strict allowlist)", () => {
     };
     await expect(resolveAllowlistedOperator(dir, identity)).resolves.toBeNull();
     expect(dir.createUser).not.toHaveBeenCalled();
+  });
+
+  it("does not link by an UNVERIFIED email (open Commerce signup)", async () => {
+    const dir = {
+      getUserByFirebaseUid: jest.fn().mockResolvedValue(undefined),
+      getUserByEmailInsensitive: jest.fn().mockResolvedValue(fakeUser({ id: 7, firebaseUid: null })),
+      updateUser: jest.fn(),
+      createUser: jest.fn(),
+    };
+    await expect(resolveAllowlistedOperator(dir, { ...identity, emailVerified: false })).resolves.toBeNull();
+    expect(dir.updateUser).not.toHaveBeenCalled();
+  });
+
+  it("does not bootstrap super_admin from an unverified email", async () => {
+    const previous = process.env.ADMIN_EMAILS;
+    process.env.ADMIN_EMAILS = "ops@vio.live";
+    try {
+      const dir = {
+        getUserByFirebaseUid: jest.fn().mockResolvedValue(undefined),
+        getUserByEmailInsensitive: jest.fn().mockResolvedValue(undefined),
+        updateUser: jest.fn(),
+        createUser: jest.fn(),
+      };
+      await expect(resolveAllowlistedOperator(dir, { ...identity, emailVerified: undefined })).resolves.toBeNull();
+      expect(dir.createUser).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.ADMIN_EMAILS;
+      else process.env.ADMIN_EMAILS = previous;
+    }
   });
 
   it("bootstraps super_admin for ADMIN_EMAILS", async () => {
@@ -321,5 +351,162 @@ describe("createApiGate — Firebase bearer (Commerce webapp)", () => {
       bearer: { verify, directory: directory(operator) },
     });
     expect(resolved).toEqual({ ok: true, operator, via: "bearer" });
+  });
+});
+
+describe("resolveOrProvisionOperator (Commerce is the only account creator)", () => {
+  const base = { uid: "c-uid", email: "Shop@brand.no", name: "Shop", emailVerified: false };
+
+  function provDir(overrides: Record<string, any> = {}) {
+    return {
+      getUserByFirebaseUid: jest.fn().mockResolvedValue(undefined),
+      getUserByEmailInsensitive: jest.fn().mockResolvedValue(undefined),
+      updateUser: jest.fn(),
+      createUser: jest.fn().mockImplementation(async (d: any) => fakeUser({ id: 50, ...d })),
+      createBusinessOperator: jest.fn().mockImplementation(async (d: any) =>
+        fakeUser({ id: 60, role: "sponsor", sponsorId: 600, firebaseUid: d.firebaseUid, email: d.email }),
+      ),
+      ...overrides,
+    };
+  }
+
+  it("returns a known user without provisioning", async () => {
+    const known = fakeUser({ id: 3, firebaseUid: "c-uid" });
+    const dir = provDir({ getUserByFirebaseUid: jest.fn().mockResolvedValue(known) });
+    await expect(resolveOrProvisionOperator(dir, base, "tok")).resolves.toEqual({ operator: known, provisioned: false });
+    expect(dir.createUser).not.toHaveBeenCalled();
+  });
+
+  it("provisions a seller (channel claim) as admin", async () => {
+    const dir = provDir();
+    const res = await resolveOrProvisionOperator(dir, { ...base, claims: { channel: true } }, "tok");
+    expect(res.operator?.role).toBe("admin");
+    expect(dir.createUser).toHaveBeenCalledWith(
+      expect.objectContaining({ role: "admin", firebaseUid: "c-uid", email: "shop@brand.no", reachuUserId: null }),
+    );
+  });
+
+  it("provisions a business as sponsor with its sponsor named after the brand", async () => {
+    const dir = provDir();
+    const res = await resolveOrProvisionOperator(
+      dir,
+      { ...base, claims: { business: true, brandName: "Kondomeriet" } },
+      "tok",
+    );
+    expect(res.operator?.role).toBe("sponsor");
+    expect(dir.createBusinessOperator).toHaveBeenCalledWith(
+      expect.objectContaining({ firebaseUid: "c-uid", sponsorName: "Kondomeriet" }),
+    );
+  });
+
+  it("falls back to Commerce when the token has no claims (supplier → sponsor, stores the Commerce id)", async () => {
+    const dir = provDir();
+    const lookup = jest.fn().mockResolvedValue({
+      commerceUserId: 1305, isBusiness: false, isSupplier: true, channelCount: 0, brandName: "Nytelse",
+    });
+    const res = await resolveOrProvisionOperator(dir, base, "the-token", lookup);
+    expect(lookup).toHaveBeenCalledWith("the-token");
+    expect(res.operator?.role).toBe("sponsor");
+    expect(dir.createBusinessOperator).toHaveBeenCalledWith(
+      expect.objectContaining({ reachuUserId: "1305", sponsorName: "Nytelse" }),
+    );
+  });
+
+  it("treats having channels in Commerce as seller", async () => {
+    const dir = provDir();
+    const lookup = jest.fn().mockResolvedValue({
+      commerceUserId: 9, isBusiness: false, isSupplier: false, channelCount: 2, brandName: null,
+    });
+    const res = await resolveOrProvisionOperator(dir, base, "tok", lookup);
+    expect(res.operator?.role).toBe("admin");
+    expect(dir.createUser).toHaveBeenCalledWith(expect.objectContaining({ reachuUserId: "9" }));
+  });
+
+  it("refuses an account that is both seller and business", async () => {
+    const dir = provDir();
+    const res = await resolveOrProvisionOperator(dir, { ...base, claims: { business: true, channel: true } }, "tok");
+    expect(res).toEqual({ operator: null, reason: "both" });
+    expect(dir.createUser).not.toHaveBeenCalled();
+    expect(dir.createBusinessOperator).not.toHaveBeenCalled();
+  });
+
+  it("refuses an account that is neither (buyer)", async () => {
+    const dir = provDir();
+    const lookup = jest.fn().mockResolvedValue(null);
+    await expect(resolveOrProvisionOperator(dir, base, "tok", lookup)).resolves.toEqual({ operator: null, reason: "none" });
+  });
+
+  it("does not create a duplicate when the email already exists unlinked", async () => {
+    const dir = provDir({ getUserByEmailInsensitive: jest.fn().mockResolvedValue(fakeUser({ id: 7, firebaseUid: null })) });
+    const res = await resolveOrProvisionOperator(dir, { ...base, claims: { channel: true } }, "tok");
+    expect(res).toEqual({ operator: null, reason: "email-conflict" });
+    expect(dir.createUser).not.toHaveBeenCalled();
+  });
+
+  it("returns the winner of a concurrent first call (unique firebase_uid)", async () => {
+    const winner = fakeUser({ id: 77, role: "admin", firebaseUid: "c-uid" });
+    const dir = provDir({
+      getUserByFirebaseUid: jest.fn().mockResolvedValueOnce(undefined).mockResolvedValue(winner),
+      createUser: jest.fn().mockRejectedValue(Object.assign(new Error("duplicate key"), { code: "23505" })),
+    });
+    const res = await resolveOrProvisionOperator(dir, { ...base, claims: { channel: true } }, "tok");
+    expect(res).toEqual({ operator: winner, provisioned: false });
+  });
+
+  it("rethrows non-unique database errors", async () => {
+    const dir = provDir({ createUser: jest.fn().mockRejectedValue(new Error("connection lost")) });
+    await expect(
+      resolveOrProvisionOperator(dir, { ...base, claims: { channel: true } }, "tok"),
+    ).rejects.toThrow("connection lost");
+  });
+});
+
+describe("createApiGate — bearer with auto-provisioning", () => {
+  it("returns 403 with the reason when the Commerce account cannot be provisioned", async () => {
+    const identity = { uid: "x", email: "x@y.no", emailVerified: true, claims: { business: true, channel: true } };
+    const dir = {
+      getUserByFirebaseUid: jest.fn().mockResolvedValue(undefined),
+      getUserByEmailInsensitive: jest.fn().mockResolvedValue(undefined),
+      updateUser: jest.fn(),
+      createUser: jest.fn(),
+      createBusinessOperator: jest.fn(),
+    };
+    const gate = createApiGate({
+      loadOperator: jest.fn(),
+      bearer: { verify: jest.fn().mockResolvedValue(identity), directory: dir, autoProvision: { directory: dir } },
+    });
+    const res = mockRes();
+    const next = jest.fn();
+    await gate(
+      { method: "GET", baseUrl: "/api", path: "/client-apps", headers: { authorization: "Bearer t" } } as any,
+      res,
+      next,
+    );
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(res.json).toHaveBeenCalledWith({ message: expect.stringMatching(/both a seller and a business/) });
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("provisions and lets a new seller through on its first call", async () => {
+    const identity = { uid: "s", email: "s@y.no", emailVerified: false, claims: { channel: true } };
+    const created = fakeUser({ id: 91, role: "admin", firebaseUid: "s" });
+    const dir = {
+      getUserByFirebaseUid: jest.fn().mockResolvedValue(undefined),
+      getUserByEmailInsensitive: jest.fn().mockResolvedValue(undefined),
+      updateUser: jest.fn(),
+      createUser: jest.fn().mockResolvedValue(created),
+      createBusinessOperator: jest.fn(),
+    };
+    const gate = createApiGate({
+      loadOperator: jest.fn(),
+      bearer: { verify: jest.fn().mockResolvedValue(identity), directory: dir, autoProvision: { directory: dir } },
+    });
+    const req: any = { method: "GET", baseUrl: "/api", path: "/client-apps", headers: { authorization: "Bearer t" } };
+    const next = jest.fn();
+    const info = jest.spyOn(console, "info").mockImplementation(() => {});
+    await gate(req, mockRes(), next);
+    info.mockRestore();
+    expect(next).toHaveBeenCalled();
+    expect(req.operator).toBe(created);
   });
 });

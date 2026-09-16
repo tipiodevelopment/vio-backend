@@ -13,6 +13,8 @@ export interface FirebaseIdentity {
   emailVerified?: boolean;
   name?: string;
   signInProvider?: string;
+  /** Account-type custom claims set by Commerce at signup (best-effort). */
+  claims?: { business?: boolean; channel?: boolean; brandName?: string | null };
 }
 
 declare global {
@@ -55,6 +57,11 @@ export function createIdTokenVerifier({ projectId, getKey }: FirebaseAuthOptions
       emailVerified: payload.email_verified === true,
       name: typeof payload.name === "string" ? payload.name : undefined,
       signInProvider: (payload.firebase as { sign_in_provider?: string } | undefined)?.sign_in_provider,
+      claims: {
+        business: payload.business === true || payload.isBusiness === true,
+        channel: payload.channel === true || payload.isChannel === true,
+        brandName: typeof payload.brand_name === "string" ? payload.brand_name : null,
+      },
     };
   };
 }
