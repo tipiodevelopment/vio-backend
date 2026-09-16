@@ -8,9 +8,9 @@ on:
       environment:
         description: "Target environment"
         required: true
-        default: development
+        default: staging
         type: choice
-        options: [development, staging, production]
+        options: [staging, production]
 
 permissions:
   id-token: write
@@ -23,7 +23,7 @@ env:
 
 jobs:
   deploy:
-    name: "Deploy → ${{ github.event.inputs.environment || 'development' }}"
+    name: "Deploy → ${{ github.event.inputs.environment || 'staging' }}"
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment == 'production' && 'production' || '' }}
 
@@ -33,7 +33,7 @@ jobs:
       - name: Set target environment
         id: env
         run: |
-          ENV="${{ github.event.inputs.environment || 'development' }}"
+          ENV="${{ github.event.inputs.environment || 'staging' }}"
           echo "name=$ENV" >> $GITHUB_OUTPUT
           echo "rg=rg-api-vio-$ENV" >> $GITHUB_OUTPUT
           echo "app=ca-api-vio-$ENV" >> $GITHUB_OUTPUT
