@@ -20,7 +20,8 @@ export type Capability =
   | "campaigns:create"
   | "campaigns:write"
   | "users:manage"
-  | "sponsor:read-own";
+  | "sponsor:read-own"
+  | "sponsor:write-own";
 
 export const ALL_CAPABILITIES: Capability[] = [
   "apps:read", "apps:create", "apps:write",
@@ -28,6 +29,7 @@ export const ALL_CAPABILITIES: Capability[] = [
   "campaigns:read", "campaigns:create", "campaigns:write",
   "users:manage",
   "sponsor:read-own",
+  "sponsor:write-own",
 ];
 
 // v1 starting point (owner decision 2026-06-10):
@@ -46,7 +48,8 @@ export const ROLE_CAPABILITIES: Record<Role, Capability[]> = {
   viewer: ["sponsors:read"],
   // Brand-facing user: sees ONLY its own footprint via /api/sponsor/me/*
   // (self-scoped to users.sponsor_id). Deliberately no operator capabilities.
-  sponsor: ["sponsor:read-own"],
+  // Its brand is editable by the brand itself (name, logo, colors).
+  sponsor: ["sponsor:read-own", "sponsor:write-own"],
 };
 
 export function can(role: Role, cap: Capability): boolean {
@@ -70,7 +73,7 @@ export function requiredCapabilityFor(method: string, path: string): Capability 
   if (/^\/api\/pending-brands(\/|$)/.test(clean)) return "users:manage";
 
   // Sponsor-facing surface — the handler always self-scopes to req.operator.sponsorId.
-  if (/^\/api\/sponsor\/me(\/|$)/.test(clean)) return "sponsor:read-own";
+  if (/^\/api\/sponsor\/me(\/|$)/.test(clean)) return mutating ? "sponsor:write-own" : "sponsor:read-own";
 
   if (/^\/api\/client-apps(\/|$)/.test(clean)) {
     if (m === "POST" && clean === "/api/client-apps") return "apps:create";
@@ -123,4 +126,52 @@ export function createOwnerId(operator: ScopeOperator | undefined, bodyUserId?: 
   if (!operator) return typeof bodyUserId === "number" ? bodyUserId : 0;
   const scope = ownerScope(operator);
   return "all" in scope ? operator.id : scope.ownerId;
+}
+
+// ── Account type & front features (2026-09-16) ──────────────────────────
+// What the unified front (webapp-vio-commerce) may SHOW each account. Every
+// account is created in Commerce; its Vio role says which side it is on.
+// These are UI features, not route guards — the routes above stay the
+// enforcement. Decisions: vio-handbook architecture/cuentas-y-capacidades.md.
+
+export type AccountType = "seller" | "business" | "internal";
+
+export type Feature =
+  | "commerce:manage"        // Vio Commerce as it is today (products, orders…)
+  | "commerce:read"          // products and orders, read-only
+  | "channels:manage"
+  | "surfaces:manage"
+  | "surfaces:read-footprint"   // only surfaces where its products appear
+  | "campaigns:manage"
+  | "campaigns:read-footprint"  // only campaigns where its products appear
+  | "broadcasts:manage"
+  | "brand:manage"           // its sponsor: name, logo, colors
+  | "analytics:surfaces"
+  | "analytics:sponsor";     // closed list, decided case by case
+
+export function accountTypeFor(role: Role): AccountType {
+  if (role === "sponsor") return "business";
+  if (role === "super_admin") return "internal";
+  return "seller";
+}
+
+export const ROLE_FEATURES: Record<Role, Feature[]> = {
+  super_admin: [
+    "commerce:manage", "channels:manage", "surfaces:manage", "campaigns:manage",
+    "broadcasts:manage", "brand:manage", "analytics:surfaces", "analytics:sponsor",
+  ],
+  // Seller (Channel signup). Broadcasts: not for now.
+  admin: ["commerce:read", "channels:manage", "surfaces:manage", "campaigns:manage", "analytics:surfaces"],
+  // Team members inside a seller tenant (not provisioned from Commerce yet).
+  operator: ["commerce:read", "campaigns:manage", "analytics:surfaces"],
+  viewer: [],
+  // Business / supplier.
+  sponsor: [
+    "commerce:manage", "channels:manage", "surfaces:read-footprint",
+    "campaigns:read-footprint", "brand:manage", "analytics:sponsor",
+  ],
+};
+
+export function featuresFor(role: Role): Feature[] {
+  return ROLE_FEATURES[role];
 }

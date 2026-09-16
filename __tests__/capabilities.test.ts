@@ -5,6 +5,8 @@ import {
   readScopeOwnerId,
   createOwnerId,
   ROLE_CAPABILITIES,
+  accountTypeFor,
+  featuresFor,
 } from "../server/middleware/capabilities";
 
 const SUPER = { id: 1, role: "super_admin" as const, parentAdminId: null };
@@ -131,9 +133,50 @@ describe("capability matrix is internally consistent", () => {
       "sponsors:read", "sponsors:write",
       "campaigns:read", "campaigns:create", "campaigns:write",
       "users:manage",
+      "sponsor:read-own", "sponsor:write-own",
     ]);
     for (const caps of Object.values(ROLE_CAPABILITIES)) {
       for (const c of caps) expect(known.has(c)).toBe(true);
     }
+  });
+});
+
+describe("brand self-edit (sponsor:write-own)", () => {
+  it("reads and writes of /api/sponsor/me map to the own-brand capabilities", () => {
+    expect(requiredCapabilityFor("GET", "/api/sponsor/me")).toBe("sponsor:read-own");
+    expect(requiredCapabilityFor("GET", "/api/sponsor/me/usage")).toBe("sponsor:read-own");
+    expect(requiredCapabilityFor("PATCH", "/api/sponsor/me")).toBe("sponsor:write-own");
+  });
+  it("only the sponsor role (and super_admin) can edit its brand", () => {
+    expect(can("sponsor", "sponsor:write-own")).toBe(true);
+    expect(can("super_admin", "sponsor:write-own")).toBe(true);
+    expect(can("admin", "sponsor:write-own")).toBe(false);
+    expect(can("operator", "sponsor:write-own")).toBe(false);
+  });
+});
+
+describe("account type & front features (cuentas-y-capacidades)", () => {
+  it("maps roles to account types", () => {
+    expect(accountTypeFor("sponsor")).toBe("business");
+    expect(accountTypeFor("admin")).toBe("seller");
+    expect(accountTypeFor("super_admin")).toBe("internal");
+  });
+
+  it("business: Commerce as today, brand, footprint-only surfaces/campaigns, no broadcasts", () => {
+    const f = featuresFor("sponsor");
+    expect(f).toEqual(expect.arrayContaining([
+      "commerce:manage", "brand:manage", "surfaces:read-footprint", "campaigns:read-footprint", "analytics:sponsor",
+    ]));
+    expect(f).not.toContain("campaigns:manage");
+    expect(f).not.toContain("surfaces:manage");
+    expect(f).not.toContain("broadcasts:manage");
+  });
+
+  it("seller: read-only Commerce, full surfaces and campaigns, no broadcasts for now", () => {
+    const f = featuresFor("admin");
+    expect(f).toEqual(expect.arrayContaining(["commerce:read", "surfaces:manage", "campaigns:manage", "analytics:surfaces"]));
+    expect(f).not.toContain("commerce:manage");
+    expect(f).not.toContain("broadcasts:manage");
+    expect(f).not.toContain("brand:manage");
   });
 });
