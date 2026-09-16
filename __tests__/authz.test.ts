@@ -366,6 +366,10 @@ describe("resolveOrProvisionOperator (Commerce is the only account creator)", ()
       createBusinessOperator: jest.fn().mockImplementation(async (d: any) =>
         fakeUser({ id: 60, role: "sponsor", sponsorId: 600, firebaseUid: d.firebaseUid, email: d.email }),
       ),
+      findClaimableSponsorIds: jest.fn().mockResolvedValue([]),
+      createOperatorForSponsor: jest.fn().mockImplementation(async (d: any) =>
+        fakeUser({ id: 70, role: "sponsor", sponsorId: d.sponsorId, firebaseUid: d.firebaseUid }),
+      ),
       ...overrides,
     };
   }
@@ -402,7 +406,7 @@ describe("resolveOrProvisionOperator (Commerce is the only account creator)", ()
   it("falls back to Commerce when the token has no claims (supplier → sponsor, stores the Commerce id)", async () => {
     const dir = provDir();
     const lookup = jest.fn().mockResolvedValue({
-      commerceUserId: 1305, isBusiness: false, isSupplier: true, brandName: "Nytelse",
+      commerceUserId: 1305, isBusiness: false, isSupplier: true, brandName: "Nytelse", channelApiKeys: [],
     });
     const res = await resolveOrProvisionOperator(dir, base, "the-token", lookup);
     expect(lookup).toHaveBeenCalledWith("the-token");
@@ -415,11 +419,54 @@ describe("resolveOrProvisionOperator (Commerce is the only account creator)", ()
   it("does NOT treat a business with channels as seller (businesses connect channels too)", async () => {
     const dir = provDir();
     const lookup = jest.fn().mockResolvedValue({
-      commerceUserId: 9, isBusiness: true, isSupplier: false, brandName: "Shop",
+      commerceUserId: 9, isBusiness: true, isSupplier: false, brandName: "Shop", channelApiKeys: [],
     });
     const res = await resolveOrProvisionOperator(dir, base, "tok", lookup);
     expect(res.operator?.role).toBe("sponsor");
     expect(dir.createUser).not.toHaveBeenCalled();
+  });
+
+  it("claims the existing sponsor that holds one of its channel keys (no duplicate)", async () => {
+    const dir = provDir({ findClaimableSponsorIds: jest.fn().mockResolvedValue([4]) });
+    const lookup = jest.fn().mockResolvedValue({
+      commerceUserId: 77, isBusiness: true, isSupplier: false, brandName: "Old Co", channelApiKeys: ["KEY-A", "KEY-B"],
+    });
+    const res = await resolveOrProvisionOperator(dir, base, "tok", lookup);
+    expect(dir.findClaimableSponsorIds).toHaveBeenCalledWith(["KEY-A", "KEY-B"]);
+    expect(dir.createOperatorForSponsor).toHaveBeenCalledWith(
+      expect.objectContaining({ sponsorId: 4, firebaseUid: "c-uid", reachuUserId: "77" }),
+    );
+    expect(dir.createBusinessOperator).not.toHaveBeenCalled();
+    expect(res.operator?.sponsorId).toBe(4);
+  });
+
+  it("does not guess when its keys match more than one sponsor", async () => {
+    const dir = provDir({ findClaimableSponsorIds: jest.fn().mockResolvedValue([1, 2]) });
+    const lookup = jest.fn().mockResolvedValue({
+      commerceUserId: 1, isBusiness: true, isSupplier: false, brandName: null, channelApiKeys: ["SHARED"],
+    });
+    await expect(resolveOrProvisionOperator(dir, base, "tok", lookup)).resolves.toEqual({
+      operator: null, reason: "ambiguous-sponsor",
+    });
+    expect(dir.createOperatorForSponsor).not.toHaveBeenCalled();
+    expect(dir.createBusinessOperator).not.toHaveBeenCalled();
+  });
+
+  it("reports a conflict when the sponsor was claimed in between", async () => {
+    const dir = provDir({
+      findClaimableSponsorIds: jest.fn().mockResolvedValue([4]),
+      createOperatorForSponsor: jest.fn().mockResolvedValue(null),
+    });
+    const lookup = jest.fn().mockResolvedValue({
+      commerceUserId: 1, isBusiness: true, isSupplier: false, brandName: null, channelApiKeys: ["K"],
+    });
+    await expect(resolveOrProvisionOperator(dir, base, "tok", lookup)).resolves.toEqual({ operator: null, reason: "conflict" });
+  });
+
+  it("never looks for sponsors to claim for a seller", async () => {
+    const dir = provDir();
+    await resolveOrProvisionOperator(dir, { ...base, claims: { channel: true } }, "tok");
+    expect(dir.findClaimableSponsorIds).not.toHaveBeenCalled();
   });
 
   it("refuses an account that is both seller and business", async () => {
@@ -470,6 +517,8 @@ describe("createApiGate — bearer with auto-provisioning", () => {
       updateUser: jest.fn(),
       createUser: jest.fn(),
       createBusinessOperator: jest.fn(),
+      findClaimableSponsorIds: jest.fn().mockResolvedValue([]),
+      createOperatorForSponsor: jest.fn(),
     };
     const gate = createApiGate({
       loadOperator: jest.fn(),
@@ -496,6 +545,8 @@ describe("createApiGate — bearer with auto-provisioning", () => {
       updateUser: jest.fn(),
       createUser: jest.fn().mockResolvedValue(created),
       createBusinessOperator: jest.fn(),
+      findClaimableSponsorIds: jest.fn().mockResolvedValue([]),
+      createOperatorForSponsor: jest.fn(),
     };
     const gate = createApiGate({
       loadOperator: jest.fn(),

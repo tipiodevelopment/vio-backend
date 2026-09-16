@@ -44,6 +44,14 @@ export interface IStorage {
     reachuUserId: string | null;
     sponsorName: string;
   }): Promise<User>;
+  findClaimableSponsorIds(channelApiKeys: string[]): Promise<number[]>;
+  createOperatorForSponsor(data: {
+    email: string | null;
+    name: string | null;
+    firebaseUid: string;
+    reachuUserId: string | null;
+    sponsorId: number;
+  }): Promise<User | null>;
   getSponsor(id: number): Promise<Sponsor | undefined>;
   getUserSponsors(userId: number): Promise<Sponsor[]>;
   getAllSponsors(): Promise<Sponsor[]>;
@@ -489,6 +497,43 @@ export class MemStorage implements IStorage {
         .where(eq(users.id, user.id))
         .returning();
       return linked;
+    });
+  }
+
+  async findClaimableSponsorIds(channelApiKeys: string[]): Promise<number[]> {
+    if (channelApiKeys.length === 0) return [];
+    const rows = await db.select({ id: sponsors.id }).from(sponsors)
+      .where(and(
+        isNull(sponsors.commerceUserUid),
+        inArray(sql`trim(${sponsors.commerceApiKey})`, channelApiKeys),
+      ))
+      .orderBy(sponsors.id);
+    return rows.map((r) => r.id);
+  }
+
+  async createOperatorForSponsor(data: {
+    email: string | null;
+    name: string | null;
+    firebaseUid: string;
+    reachuUserId: string | null;
+    sponsorId: number;
+  }): Promise<User | null> {
+    return db.transaction(async (tx) => {
+      // Guarded claim: only if still unclaimed (a concurrent claim wins once).
+      const claimed = await tx.update(sponsors)
+        .set({ commerceUserUid: data.firebaseUid })
+        .where(and(eq(sponsors.id, data.sponsorId), isNull(sponsors.commerceUserUid)))
+        .returning({ id: sponsors.id });
+      if (claimed.length === 0) return null;
+      const [user] = await tx.insert(users).values({
+        email: data.email,
+        name: data.name,
+        firebaseUid: data.firebaseUid,
+        reachuUserId: data.reachuUserId,
+        role: "sponsor",
+        sponsorId: data.sponsorId,
+      }).returning();
+      return user;
     });
   }
 

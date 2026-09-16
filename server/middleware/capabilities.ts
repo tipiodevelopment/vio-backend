@@ -21,7 +21,8 @@ export type Capability =
   | "campaigns:write"
   | "users:manage"
   | "sponsor:read-own"
-  | "sponsor:write-own";
+  | "sponsor:write-own"
+  | "uploads:write";
 
 export const ALL_CAPABILITIES: Capability[] = [
   "apps:read", "apps:create", "apps:write",
@@ -30,6 +31,7 @@ export const ALL_CAPABILITIES: Capability[] = [
   "users:manage",
   "sponsor:read-own",
   "sponsor:write-own",
+  "uploads:write",
 ];
 
 // v1 starting point (owner decision 2026-06-10):
@@ -43,13 +45,14 @@ export const ROLE_CAPABILITIES: Record<Role, Capability[]> = {
     "apps:read", "apps:create", "apps:write",
     "sponsors:read", "sponsors:write",
     "campaigns:read", "campaigns:create", "campaigns:write",
+    "uploads:write",
   ],
   operator: ["apps:read", "campaigns:read", "campaigns:create"],
   viewer: ["sponsors:read"],
   // Brand-facing user: sees ONLY its own footprint via /api/sponsor/me/*
   // (self-scoped to users.sponsor_id). Deliberately no operator capabilities.
   // Its brand is editable by the brand itself (name, logo, colors).
-  sponsor: ["sponsor:read-own", "sponsor:write-own"],
+  sponsor: ["sponsor:read-own", "sponsor:write-own", "uploads:write"],
 };
 
 export function can(role: Role, cap: Capability): boolean {
@@ -74,6 +77,11 @@ export function requiredCapabilityFor(method: string, path: string): Capability 
 
   // Sponsor-facing surface — the handler always self-scopes to req.operator.sponsorId.
   if (/^\/api\/sponsor\/me(\/|$)/.test(clean)) return mutating ? "sponsor:write-own" : "sponsor:read-own";
+
+  // Image uploads (signed PUT URL + path normalization). Same audience as
+  // before (admin via the campaigns:write fallback) plus the brand, which
+  // uploads its own logo.
+  if (/^\/api\/(objects\/upload|campaign-logo)$/.test(clean)) return "uploads:write";
 
   if (/^\/api\/client-apps(\/|$)/.test(clean)) {
     if (m === "POST" && clean === "/api/client-apps") return "apps:create";

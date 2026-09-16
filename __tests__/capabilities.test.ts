@@ -134,6 +134,7 @@ describe("capability matrix is internally consistent", () => {
       "campaigns:read", "campaigns:create", "campaigns:write",
       "users:manage",
       "sponsor:read-own", "sponsor:write-own",
+      "uploads:write",
     ]);
     for (const caps of Object.values(ROLE_CAPABILITIES)) {
       for (const c of caps) expect(known.has(c)).toBe(true);
@@ -178,5 +179,19 @@ describe("account type & front features (cuentas-y-capacidades)", () => {
     expect(f).not.toContain("commerce:manage");
     expect(f).not.toContain("broadcasts:manage");
     expect(f).not.toContain("brand:manage");
+  });
+});
+
+describe("image uploads (uploads:write)", () => {
+  it("maps the upload endpoints to uploads:write", () => {
+    expect(requiredCapabilityFor("POST", "/api/objects/upload")).toBe("uploads:write");
+    expect(requiredCapabilityFor("PUT", "/api/campaign-logo")).toBe("uploads:write");
+  });
+  it("keeps the previous audience (admin) and adds the brand; operator/viewer stay out", () => {
+    expect(can("admin", "uploads:write")).toBe(true);
+    expect(can("super_admin", "uploads:write")).toBe(true);
+    expect(can("sponsor", "uploads:write")).toBe(true);
+    expect(can("operator", "uploads:write")).toBe(false);
+    expect(can("viewer", "uploads:write")).toBe(false);
   });
 });
