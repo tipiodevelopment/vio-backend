@@ -17,6 +17,10 @@
  *   2. Commerce itself, with the same token, when COMMERCE_API_URL is set:
  *      `GET /api/users/me` (isBusiness, isSupplier, business). Covers
  *      business/supplier accounts created before the claims existed.
+ *      `GET /api/channel/user` gives the caller's channel api keys — NOT to
+ *      decide the kind, but to CLAIM a sponsor that already exists with one
+ *      of those keys (created by hand before accounts were unified), so the
+ *      business is linked to it instead of getting a duplicate.
  *
  * Having channels in Commerce does NOT mean seller: businesses connect
  * channels too (the webapp's Channels section is for every account).
@@ -32,6 +36,8 @@ export interface CommerceProfile {
   isBusiness: boolean;
   isSupplier: boolean;
   brandName: string | null;
+  /** Raw api keys of the caller's channels (in memory only, never stored). */
+  channelApiKeys: string[];
 }
 
 export type CommerceProfileLookup = (idToken: string) => Promise<CommerceProfile | null>;
@@ -57,6 +63,17 @@ export function brandNameFor(identity: FirebaseIdentity, profile: CommerceProfil
   return name.slice(0, 255); // sponsors.name is varchar(255)
 }
 
+/** base-api answers the channel list as an array, or wrapped in `data`. */
+export function channelApiKeysFrom(payload: unknown): string[] {
+  const p = payload as any;
+  const rows: any[] = Array.isArray(p) ? p : Array.isArray(p?.data) ? p.data : [];
+  const keys = rows
+    .map((r) => r?.userChannelApiKey?.apiKey)
+    .filter((k): k is string => typeof k === "string" && k.trim().length > 0)
+    .map((k) => k.trim());
+  return Array.from(new Set(keys));
+}
+
 async function getJson(url: string, idToken: string, fetchImpl: typeof fetch, timeoutMs: number): Promise<unknown> {
   const res = await fetchImpl(url, {
     // base-api reads the raw Firebase token from `authorization` (no "Bearer").
@@ -78,7 +95,14 @@ export function createCommerceProfileLookup(opts: {
 
   return async (idToken) => {
     try {
-      const me = (await getJson(`${base}/api/users/me`, idToken, doFetch, timeoutMs)) as Record<string, any>;
+      const [me, channels] = await Promise.all([
+        getJson(`${base}/api/users/me`, idToken, doFetch, timeoutMs) as Promise<Record<string, any>>,
+        // Best-effort: without keys we just cannot claim an existing sponsor.
+        getJson(`${base}/api/channel/user`, idToken, doFetch, timeoutMs).catch((err) => {
+          console.warn("[commerce-account] channel lookup failed:", (err as Error).message);
+          return null;
+        }),
+      ]);
       const id = Number(me?.id);
       return {
         commerceUserId: Number.isInteger(id) && id > 0 ? id : null,
@@ -88,6 +112,7 @@ export function createCommerceProfileLookup(opts: {
           (typeof me?.brandName === "string" && me.brandName) ||
           (typeof me?.business?.businessName === "string" && me.business.businessName) ||
           null,
+        channelApiKeys: channelApiKeysFrom(channels),
       };
     } catch (err) {
       // Commerce down or the token rejected there: fall back to the claims.

@@ -95,6 +95,19 @@ export interface ProvisioningDirectory extends OperatorDirectory {
     reachuUserId: string | null;
     sponsorName: string;
   }): Promise<User>;
+  /** Unclaimed sponsors (no commerce_user_uid) holding one of these channel api keys. */
+  findClaimableSponsorIds(channelApiKeys: string[]): Promise<number[]>;
+  /**
+   * Claim an existing sponsor for this Commerce account and create its user
+   * (role sponsor), atomically. null if someone else claimed it first.
+   */
+  createOperatorForSponsor(data: {
+    email: string | null;
+    name: string | null;
+    firebaseUid: string;
+    reachuUserId: string | null;
+    sponsorId: number;
+  }): Promise<User | null>;
 }
 
 function bootstrapAdminEmails(): string[] {
@@ -154,7 +167,9 @@ export async function resolveAllowlistedOperator(
 
 export type ProvisionResult =
   | { operator: User; provisioned: boolean }
-  | { operator: null; reason: "email-conflict" | "both" | "none" | "conflict" };
+  | { operator: null; reason: NotProvisionedReason };
+
+type NotProvisionedReason = "email-conflict" | "both" | "none" | "conflict" | "ambiguous-sponsor";
 
 function isUniqueViolation(err: unknown): boolean {
   return (err as { code?: string } | null)?.code === "23505";
@@ -192,17 +207,37 @@ export async function resolveOrProvisionOperator(
   const reachuUserId = profile?.commerceUserId != null ? String(profile.commerceUserId) : null;
 
   try {
-    const operator =
-      kind === "seller"
-        ? await dir.createUser({ email, name, firebaseUid: identity.uid, role: "admin", reachuUserId })
-        : await dir.createBusinessOperator({
-            email,
-            name,
-            firebaseUid: identity.uid,
-            reachuUserId,
-            sponsorName: brandNameFor(identity, profile),
-          });
-    console.info(`[authz] provisioned ${kind} uid=${identity.uid} as user ${operator.id} (${operator.role})`);
+    if (kind === "seller") {
+      const operator = await dir.createUser({ email, name, firebaseUid: identity.uid, role: "admin", reachuUserId });
+      console.info(`[authz] provisioned seller uid=${identity.uid} as user ${operator.id}`);
+      return { operator, provisioned: true };
+    }
+
+    // Business: a sponsor created by hand before accounts were unified may
+    // already hold one of its channel keys — link to it, never duplicate.
+    const keys = profile?.channelApiKeys ?? [];
+    const claimable = keys.length > 0 ? await dir.findClaimableSponsorIds(keys) : [];
+    if (claimable.length > 1) {
+      console.warn(`[authz] uid=${identity.uid} matches sponsors ${claimable.join(",")} — not guessing`);
+      return { operator: null, reason: "ambiguous-sponsor" };
+    }
+    if (claimable.length === 1) {
+      const operator = await dir.createOperatorForSponsor({
+        email, name, firebaseUid: identity.uid, reachuUserId, sponsorId: claimable[0],
+      });
+      if (!operator) return { operator: null, reason: "conflict" };
+      console.info(`[authz] business uid=${identity.uid} claimed sponsor ${claimable[0]} as user ${operator.id}`);
+      return { operator, provisioned: true };
+    }
+
+    const operator = await dir.createBusinessOperator({
+      email,
+      name,
+      firebaseUid: identity.uid,
+      reachuUserId,
+      sponsorName: brandNameFor(identity, profile),
+    });
+    console.info(`[authz] provisioned business uid=${identity.uid} as user ${operator.id} (new sponsor ${operator.sponsorId})`);
     return { operator, provisioned: true };
   } catch (err) {
     if (!isUniqueViolation(err)) throw err;
@@ -213,11 +248,12 @@ export async function resolveOrProvisionOperator(
   }
 }
 
-const NOT_PROVISIONED_MESSAGE: Record<"email-conflict" | "both" | "none" | "conflict", string> = {
+const NOT_PROVISIONED_MESSAGE: Record<NotProvisionedReason, string> = {
   "email-conflict": "This email is already registered in Vio under another login — contact support",
   both: "This Commerce account is both a seller and a business — contact support",
   none: "Only Commerce sellers and businesses can use Vio",
   conflict: "Account could not be provisioned — contact support",
+  "ambiguous-sponsor": "Your channels match more than one Vio brand — contact support",
 };
 
 // ── Route policy ─────────────────────────────────────────────────────────
