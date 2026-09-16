@@ -29,36 +29,47 @@ interface FirebaseAuthOptions {
   getKey?: JWTVerifyGetKey;
 }
 
-export function createFirebaseAuth({ projectId, getKey }: FirebaseAuthOptions): RequestHandler {
+export type IdTokenVerifier = (token: string) => Promise<FirebaseIdentity>;
+
+export function readBearerToken(req: Pick<Request, "headers">): string | null {
+  const header = req.headers.authorization ?? "";
+  return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
+}
+
+/** Pure verifier: resolves the identity or throws on any invalid token. */
+export function createIdTokenVerifier({ projectId, getKey }: FirebaseAuthOptions): IdTokenVerifier {
   const keyResolver = getKey ?? createRemoteJWKSet(new URL(FIREBASE_JWKS_URL));
 
-  return async function firebaseAuthHandler(req: Request, res: Response, next: NextFunction) {
-    const header = req.headers.authorization ?? "";
-    const token = header.startsWith("Bearer ") ? header.slice("Bearer ".length) : null;
+  return async (token) => {
+    const { payload } = await jwtVerify(token, keyResolver, {
+      issuer: `https://securetoken.google.com/${projectId}`,
+      audience: projectId,
+      algorithms: ["RS256"],
+    });
 
+    if (!payload.sub) throw new Error("Token has no subject (uid)");
+
+    return {
+      uid: payload.sub,
+      email: typeof payload.email === "string" ? payload.email : undefined,
+      emailVerified: payload.email_verified === true,
+      name: typeof payload.name === "string" ? payload.name : undefined,
+      signInProvider: (payload.firebase as { sign_in_provider?: string } | undefined)?.sign_in_provider,
+    };
+  };
+}
+
+export function createFirebaseAuth(options: FirebaseAuthOptions): RequestHandler {
+  const verify = createIdTokenVerifier(options);
+
+  return async function firebaseAuthHandler(req: Request, res: Response, next: NextFunction) {
+    const token = readBearerToken(req);
     if (!token) {
       return res.status(401).json({ message: "Missing Authorization: Bearer <Firebase ID token>" });
     }
 
     try {
-      const { payload } = await jwtVerify(token, keyResolver, {
-        issuer: `https://securetoken.google.com/${projectId}`,
-        audience: projectId,
-        algorithms: ["RS256"],
-      });
-
-      if (!payload.sub) {
-        return res.status(401).json({ message: "Token has no subject (uid)" });
-      }
-
-      req.firebaseIdentity = {
-        uid: payload.sub,
-        email: typeof payload.email === "string" ? payload.email : undefined,
-        emailVerified: payload.email_verified === true,
-        name: typeof payload.name === "string" ? payload.name : undefined,
-        signInProvider: (payload.firebase as { sign_in_provider?: string } | undefined)?.sign_in_provider,
-      };
-
+      req.firebaseIdentity = await verify(token);
       next();
     } catch {
       return res.status(401).json({ message: "Invalid or expired Firebase ID token" });
@@ -80,3 +91,14 @@ export const firebaseAuth: RequestHandler = (req, res, next) => {
   }
   return defaultHandler(req, res, next);
 };
+
+let defaultVerifier: IdTokenVerifier | null = null;
+
+// Env-driven verifier for the /api gate (webapp → vio-backend with the
+// Commerce Firebase token). null when FIREBASE_PROJECT_ID is not configured.
+export function envIdTokenVerifier(): IdTokenVerifier | null {
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  if (!projectId) return null;
+  if (!defaultVerifier) defaultVerifier = createIdTokenVerifier({ projectId });
+  return defaultVerifier;
+}

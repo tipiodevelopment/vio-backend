@@ -6,6 +6,7 @@ import {
   isPublicApiPath,
   readSessionOperatorId,
   resolveAllowlistedOperator,
+  resolveRequestOperator,
 } from "../server/middleware/authz";
 
 process.env.SESSION_SECRET = process.env.SESSION_SECRET || "test-secret";
@@ -194,5 +195,131 @@ describe("createApiGate", () => {
     await gate(req, res, next);
     expect(next).toHaveBeenCalled();
     expect(req.operator).toBe(operator);
+  });
+});
+
+// Commerce webapp path: another origin, no cookie — the Firebase ID token
+// travels as `Authorization: Bearer` and is checked against a real (local)
+// JWKS so the whole verify → allowlist → capability chain runs.
+describe("createApiGate — Firebase bearer (Commerce webapp)", () => {
+  const PROJECT_ID = "reachu-qa";
+  let verify: import("../server/middleware/firebase-auth").IdTokenVerifier;
+  let signToken: (opts?: { sub?: string; aud?: string; email?: string }) => Promise<string>;
+
+  beforeAll(async () => {
+    const { createLocalJWKSet, exportJWK, generateKeyPair, SignJWT } = await import("jose");
+    const { createIdTokenVerifier } = await import("../server/middleware/firebase-auth");
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    const getKey = createLocalJWKSet({ keys: [{ ...jwk, alg: "RS256", use: "sig", kid: "k1" }] });
+    verify = createIdTokenVerifier({ projectId: PROJECT_ID, getKey });
+    signToken = async (opts = {}) =>
+      new SignJWT({ email: opts.email ?? "brand@shop.no", email_verified: true })
+        .setProtectedHeader({ alg: "RS256", kid: "k1" })
+        .setIssuer(`https://securetoken.google.com/${PROJECT_ID}`)
+        .setAudience(opts.aud ?? PROJECT_ID)
+        .setSubject(opts.sub ?? "commerce-uid")
+        .setIssuedAt()
+        .setExpirationTime("1h")
+        .sign(privateKey);
+  });
+
+  function directory(user?: User) {
+    return {
+      getUserByFirebaseUid: jest.fn().mockResolvedValue(user),
+      getUserByEmailInsensitive: jest.fn().mockResolvedValue(undefined),
+      updateUser: jest.fn(),
+      createUser: jest.fn(),
+    };
+  }
+
+  function reqWithBearer(token: string, method: string, path: string, extraHeaders: Record<string, string> = {}) {
+    return {
+      method,
+      baseUrl: "/api",
+      path: path.replace(/^\/api/, ""),
+      headers: { authorization: `Bearer ${token}`, ...extraHeaders },
+    } as any;
+  }
+
+  it("attaches the provisioned operator for a valid token", async () => {
+    const operator = fakeUser({ id: 5, role: "admin", firebaseUid: "commerce-uid" });
+    const gate = createApiGate({ loadOperator: jest.fn(), bearer: { verify, directory: directory(operator) } });
+    const res = mockRes();
+    const next = jest.fn();
+    const req = reqWithBearer(await signToken(), "GET", "/api/client-apps");
+    await gate(req, res, next);
+    expect(next).toHaveBeenCalled();
+    expect(req.operator).toBe(operator);
+  });
+
+  it("returns 403 for a valid token whose account is not provisioned", async () => {
+    const gate = createApiGate({ loadOperator: jest.fn(), bearer: { verify, directory: directory(undefined) } });
+    const res = mockRes();
+    const next = jest.fn();
+    await gate(reqWithBearer(await signToken(), "GET", "/api/client-apps"), res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 for a token from another Firebase project", async () => {
+    const gate = createApiGate({
+      loadOperator: jest.fn(),
+      bearer: { verify, directory: directory(fakeUser({ role: "admin" })) },
+    });
+    const res = mockRes();
+    const next = jest.fn();
+    await gate(reqWithBearer(await signToken({ aud: "some-other-project" }), "GET", "/api/client-apps"), res, next);
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("returns 401 for garbage in the bearer", async () => {
+    const gate = createApiGate({ loadOperator: jest.fn(), bearer: { verify, directory: directory() } });
+    const res = mockRes();
+    const next = jest.fn();
+    await gate(reqWithBearer("not-a-jwt", "GET", "/api/client-apps"), res, next);
+    expect(res.status).toHaveBeenCalledWith(401);
+  });
+
+  it("still enforces the role capability on the bearer path", async () => {
+    const viewer = fakeUser({ role: "viewer", firebaseUid: "commerce-uid" });
+    const gate = createApiGate({ loadOperator: jest.fn(), bearer: { verify, directory: directory(viewer) } });
+    const res = mockRes();
+    const next = jest.fn();
+    await gate(reqWithBearer(await signToken(), "POST", "/api/campaigns"), res, next);
+    expect(res.status).toHaveBeenCalledWith(403);
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("ignores the bearer when the gate is cookie-only (not configured)", async () => {
+    const dir = directory(fakeUser({ role: "admin" }));
+    const gate = createApiGate({ loadOperator: jest.fn() });
+    const res = mockRes();
+    const next = jest.fn();
+    await gate(reqWithBearer(await signToken(), "GET", "/api/client-apps"), res, next);
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(dir.getUserByFirebaseUid).not.toHaveBeenCalled();
+  });
+
+  it("prefers the session cookie when both are present", async () => {
+    const sessionOperator = fakeUser({ id: 1, role: "admin" });
+    const bearerOperator = fakeUser({ id: 2, role: "admin", firebaseUid: "commerce-uid" });
+    const dir = directory(bearerOperator);
+    const opts = { loadOperator: jest.fn().mockResolvedValue(sessionOperator), bearer: { verify, directory: dir } };
+    const token = await signToken();
+    const cookie = `${SESSION_COOKIE}=${createSessionToken(1)}`;
+    const resolved = await resolveRequestOperator(reqWithBearer(token, "GET", "/api/client-apps", { cookie }), opts);
+    expect(resolved).toEqual({ ok: true, operator: sessionOperator, via: "session" });
+    expect(dir.getUserByFirebaseUid).not.toHaveBeenCalled();
+  });
+
+  it("reports the bearer path in resolveRequestOperator", async () => {
+    const operator = fakeUser({ id: 9, role: "sponsor", firebaseUid: "commerce-uid" });
+    const resolved = await resolveRequestOperator(reqWithBearer(await signToken(), "GET", "/api/auth/me"), {
+      loadOperator: jest.fn(),
+      bearer: { verify, directory: directory(operator) },
+    });
+    expect(resolved).toEqual({ ok: true, operator, via: "bearer" });
   });
 });

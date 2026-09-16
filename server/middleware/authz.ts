@@ -1,7 +1,7 @@
 import type { Request, Response, RequestHandler } from "express";
 import jwt from "jsonwebtoken";
 import type { User } from "@shared/schema";
-import type { FirebaseIdentity } from "./firebase-auth";
+import { readBearerToken, type FirebaseIdentity, type IdTokenVerifier } from "./firebase-auth";
 import { can, requiredCapabilityFor, type Role } from "./capabilities";
 
 // Operator sessions (ADR-0007, F2/F3).
@@ -148,7 +148,50 @@ export function isPublicApiPath(method: string, path: string): boolean {
 
 // ── The /api gate ────────────────────────────────────────────────────────
 
-export function createApiGate(opts: { loadOperator: (id: number) => Promise<User | undefined> }): RequestHandler {
+export interface ApiGateOptions {
+  loadOperator: (id: number) => Promise<User | undefined>;
+  /**
+   * Stateless path for the Commerce webapp (a different origin, no cookie):
+   * `Authorization: Bearer <Firebase ID token>` resolved through the same
+   * strict allowlist as the session login. Omitted → cookie only.
+   */
+  bearer?: { verify: IdTokenVerifier; directory: OperatorDirectory };
+}
+
+export type OperatorResolution =
+  | { ok: true; operator: User; via: "session" | "bearer" }
+  | { ok: false; status: 401 | 403; message: string; clearCookie?: boolean };
+
+/**
+ * Who is calling: the session cookie wins; otherwise a Firebase bearer
+ * token. Shared by the /api gate and GET /api/auth/me so both paths answer
+ * the same way.
+ */
+export async function resolveRequestOperator(req: Request, opts: ApiGateOptions): Promise<OperatorResolution> {
+  const operatorId = readSessionOperatorId(req);
+  if (operatorId) {
+    const operator = await opts.loadOperator(operatorId);
+    if (!operator) return { ok: false, status: 401, message: "Session no longer valid", clearCookie: true };
+    return { ok: true, operator, via: "session" };
+  }
+
+  const token = opts.bearer ? readBearerToken(req) : null;
+  if (opts.bearer && token) {
+    let identity: FirebaseIdentity;
+    try {
+      identity = await opts.bearer.verify(token);
+    } catch {
+      return { ok: false, status: 401, message: "Invalid or expired Firebase ID token" };
+    }
+    const operator = await resolveAllowlistedOperator(opts.bearer.directory, identity);
+    if (!operator) return { ok: false, status: 403, message: "Account is not provisioned for this dashboard" };
+    return { ok: true, operator, via: "bearer" };
+  }
+
+  return { ok: false, status: 401, message: "Authentication required" };
+}
+
+export function createApiGate(opts: ApiGateOptions): RequestHandler {
   return async (req, res, next) => {
     // Mounted at app.use('/api', …): req.path lacks the mount prefix.
     const path = `${req.baseUrl}${req.path}`.replace(/\/+$/, "") || req.baseUrl;
@@ -156,16 +199,12 @@ export function createApiGate(opts: { loadOperator: (id: number) => Promise<User
 
     if (isPublicApiPath(method, path)) return next();
 
-    const operatorId = readSessionOperatorId(req);
-    if (!operatorId) {
-      return res.status(401).json({ message: "Authentication required" });
+    const resolved = await resolveRequestOperator(req, opts);
+    if (!resolved.ok) {
+      if (resolved.clearCookie) clearSessionCookie(res);
+      return res.status(resolved.status).json({ message: resolved.message });
     }
-
-    const operator = await opts.loadOperator(operatorId);
-    if (!operator) {
-      clearSessionCookie(res);
-      return res.status(401).json({ message: "Session no longer valid" });
-    }
+    const { operator } = resolved;
 
     const required = requiredCapabilityFor(method, path);
     if (!can(operator.role, required)) {
