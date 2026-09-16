@@ -78,7 +78,26 @@ describe("firebase-auth middleware", () => {
       emailVerified: true,
       name: "Ops Tester",
       signInProvider: "password",
+      claims: { business: false, channel: false, brandName: null },
     });
+  });
+
+  it("exposes the Commerce account-type claims", async () => {
+    const { publicKey, privateKey } = await generateKeyPair("RS256");
+    const jwk = await exportJWK(publicKey);
+    const getKey = createLocalJWKSet({ keys: [{ ...jwk, alg: "RS256", use: "sig", kid: "claims-key" }] });
+    const mw = createFirebaseAuth({ projectId: PROJECT_ID, getKey });
+    const token = await new SignJWT({ email: "brand@shop.no", business: true, channel: false, brand_name: "Shop AS" })
+      .setProtectedHeader({ alg: "RS256", kid: "claims-key" })
+      .setIssuer(ISSUER)
+      .setAudience(PROJECT_ID)
+      .setSubject("uid-b")
+      .setIssuedAt()
+      .setExpirationTime("1h")
+      .sign(privateKey);
+    const req: any = { headers: { authorization: `Bearer ${token}` } };
+    await mw(req, mockRes(), jest.fn());
+    expect(req.firebaseIdentity.claims).toEqual({ business: true, channel: false, brandName: "Shop AS" });
   });
 
   it("rejects a token for another audience (project)", async () => {

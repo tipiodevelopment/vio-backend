@@ -36,6 +36,14 @@ export interface IStorage {
   
   // Sponsor methods
   createSponsor(sponsor: InsertSponsor): Promise<Sponsor>;
+  /** Auto-provisioning of a Commerce business: user (role sponsor) + its sponsor, in one transaction. */
+  createBusinessOperator(data: {
+    email: string | null;
+    name: string | null;
+    firebaseUid: string;
+    reachuUserId: string | null;
+    sponsorName: string;
+  }): Promise<User>;
   getSponsor(id: number): Promise<Sponsor | undefined>;
   getUserSponsors(userId: number): Promise<Sponsor[]>;
   getAllSponsors(): Promise<Sponsor[]>;
@@ -453,6 +461,35 @@ export class MemStorage implements IStorage {
   async createSponsor(sponsor: InsertSponsor): Promise<Sponsor> {
     const [newSponsor] = await db.insert(sponsors).values(sponsor).returning();
     return newSponsor;
+  }
+
+  async createBusinessOperator(data: {
+    email: string | null;
+    name: string | null;
+    firebaseUid: string;
+    reachuUserId: string | null;
+    sponsorName: string;
+  }): Promise<User> {
+    return db.transaction(async (tx) => {
+      const [user] = await tx.insert(users).values({
+        email: data.email,
+        name: data.name,
+        firebaseUid: data.firebaseUid,
+        reachuUserId: data.reachuUserId,
+        role: "sponsor",
+      }).returning();
+      // The brand owns its own sponsor row (it is its own tenant).
+      const [sponsor] = await tx.insert(sponsors).values({
+        userId: user.id,
+        name: data.sponsorName,
+        commerceUserUid: data.firebaseUid,
+      }).returning();
+      const [linked] = await tx.update(users)
+        .set({ sponsorId: sponsor.id })
+        .where(eq(users.id, user.id))
+        .returning();
+      return linked;
+    });
   }
 
   async getSponsor(id: number): Promise<Sponsor | undefined> {

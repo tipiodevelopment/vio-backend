@@ -56,16 +56,18 @@ import { calculateScheduledTimes, validateScheduling } from "./utils/scheduling"
 import { voteQueue, contestParticipationQueue, isQueueEnabled } from "./queue/queues";
 import { createRateLimiter, rateLimitPresets } from "./middleware/rate-limiter";
 import { validateBroadcastId } from "./middleware/broadcast-validator";
-import { firebaseAuth } from "./middleware/firebase-auth";
+import { firebaseAuth, envIdTokenVerifier } from "./middleware/firebase-auth";
 import { ensureFirebaseUser, deleteFirebaseUser, isFirebaseAdminEnabled, listPendingSignups } from "./services/firebase-admin";
 import { verifyCommerceApiKey } from "./services/commerce";
+import { envCommerceProfileLookup } from "./services/commerce-account";
 import {
   createApiGate,
   createSessionToken,
   setSessionCookie,
   clearSessionCookie,
-  readSessionOperatorId,
   resolveAllowlistedOperator,
+  resolveRequestOperator,
+  type ApiGateOptions,
 } from "./middleware/authz";
 import { ownerScope, readScopeOwnerId, createOwnerId } from "./middleware/capabilities";
 import { createOwnershipGuard } from "./middleware/resource-ownership";
@@ -1106,21 +1108,33 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
     res.status(204).end();
   });
 
+  // Who is calling: session cookie (Vio dashboard) or Firebase bearer token
+  // (Commerce webapp, another origin — stateless, no cookie).
+  const idTokenVerifier = envIdTokenVerifier();
+  const gateOptions: ApiGateOptions = {
+    loadOperator: (id) => storage.getUser(id),
+    bearer: idTokenVerifier
+      ? {
+          verify: idTokenVerifier,
+          directory: storage,
+          // Commerce is the only place that creates accounts (2026-09-16).
+          autoProvision: { directory: storage, lookupProfile: envCommerceProfileLookup() ?? undefined },
+        }
+      : undefined,
+  };
+
   app.get('/api/auth/me', async (req, res) => {
     try {
-      const operatorId = readSessionOperatorId(req);
-      if (operatorId) {
-        const operator = await storage.getUser(operatorId);
-        if (operator) return res.json(operatorProfile(operator));
-      }
-      res.status(401).json({ message: 'No active session' });
+      const resolved = await resolveRequestOperator(req, gateOptions);
+      if (resolved.ok) return res.json(operatorProfile(resolved.operator));
+      res.status(resolved.status).json({ message: resolved.status === 401 ? 'No active session' : resolved.message });
     } catch (error) {
       console.error('Error reading session:', error);
       res.status(500).json({ message: 'Error reading session' });
     }
   });
 
-  app.use('/api', createApiGate({ loadOperator: (id) => storage.getUser(id) }));
+  app.use('/api', createApiGate(gateOptions));
   // Per-resource tenant ownership (ADR-0008): after the capability gate, block
   // cross-tenant access to a specific resource by id. super_admin bypasses.
   app.use('/api', createOwnershipGuard(storage));
