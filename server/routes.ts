@@ -1336,10 +1336,25 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
 
       const sponsors = await storage.getSponsorsByApiKey(_apiKey);
       if (!sponsors || sponsors.length === 0) {
-        throw new Error('Sponsors not found for provided API key');
+        // Una API key que no corresponde a ningun sponsor es un error del
+        // cliente, no una falla del servidor. Devolverlo como 500 hacia que un
+        // dato invalido fuera indistinguible de una caida: el 2026-09-28 una
+        // cuenta de prueba de Commerce generaba 500 cada pocos minutos contra
+        // produccion, y hubo que rastrearla hasta la base para descubrir que no
+        // pasaba nada. La key NO se incluye en el mensaje: viaja en el path y
+        // termina en los access.log de cualquier proxy.
+        return res.status(404).json({
+          message: "No sponsor matches the provided API key",
+          status: "error",
+          code: 404,
+        });
       }
-      if(paymentMethods && !Array.isArray(paymentMethods)) {
-        throw new Error('paymentMethods should be an array');
+      if (paymentMethods && !Array.isArray(paymentMethods)) {
+        return res.status(400).json({
+          message: "paymentMethods should be an array",
+          status: "error",
+          code: 400,
+        });
       }
 
       const processSponsors = async (sponsor: Sponsor) => {
@@ -1352,7 +1367,9 @@ export async function registerRoutes(app: Express, existingServer?: Server): Pro
 
       await Promise.allSettled(sponsors.map(processSponsors));
       
-      response.message = `Payment methods updated successfully: ${JSON.stringify(paymentMethods)} to ${sponsors.length} sponsor(s) with API key ${_apiKey}`;
+      // Sin la API key en el mensaje: el que llama ya la tiene, y este texto
+      // termina en logs de Commerce y de cualquier proxy intermedio.
+      response.message = `Payment methods updated successfully: ${JSON.stringify(paymentMethods)} to ${sponsors.length} sponsor(s)`;
 
     } catch (error) {
       console.error('Error updating payment methods:', error);
