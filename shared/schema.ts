@@ -68,6 +68,18 @@ export const clientApps = pgTable("client_apps", {
   tvEnabled: boolean("tv_enabled").notNull().default(false),
   /** Array of TV platforms supported: ['apple-tv', 'android-tv', 'fire-tv', ...] */
   tvPlatforms: text("tv_platforms").array().default(sql`'{}'`).notNull(),
+  /**
+   * How much context analytics may keep for this surface (2026-10-13).
+   *   'standard' — the full v1 contract.
+   *   'minimal'  — the collector DROPS what can reveal why someone is on the
+   *                page: content url/title, product name/brand and free-form
+   *                props, and does NOT fan out to any vendor sink. What is
+   *                left measures the funnel and bills the sale (ids, amounts).
+   * For surfaces where the content itself is sensitive — a health app browsing
+   * a condition is special-category data by inference, even for an anonymous
+   * device. Enforced server-side so an old SDK cannot leak it anyway.
+   */
+  privacyMode: varchar("privacy_mode", { length: 16 }).notNull().default('standard'),
   createdAt: timestamp("created_at").defaultNow().notNull()
 });
 
