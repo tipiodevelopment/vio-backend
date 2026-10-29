@@ -1,9 +1,10 @@
-import { useQuery } from '@tanstack/react-query';
+import { useQueries, useQuery } from '@tanstack/react-query';
 import { Link } from 'wouter';
 import { Button } from '@/components/ui/button';
 import { useUser } from '@/contexts/UserContext';
 import { AppLayout } from '@/components/AppLayout';
 import type { ClientApp, Campaign, Broadcast, Channel } from '@shared/schema';
+import { formatPct } from '@/lib/rates';
 import {
   BarChart3,
   Megaphone,
@@ -64,6 +65,36 @@ function getAppPlaceholder(name: string) {
   );
 }
 
+/**
+ * Click rate across every surface the account owns, last 7 days.
+ *
+ * The collector answers one surface at a time, so the totals are summed here — fine for
+ * the handful of surfaces an operator has today. An account with dozens would want this
+ * as a single query in the collector instead of N requests from the home page.
+ */
+function useClickRate(clientApps: ClientApp[], userId: number | null | undefined) {
+  const results = useQueries({
+    queries: clientApps.map((app) => ({
+      queryKey: ['/api/analytics/vio/bundle', app.id, userId, '7d'],
+      queryFn: async () => {
+        const res = await fetch(`/api/analytics/vio/bundle?userId=${userId}&clientAppId=${app.id}&range=7d`);
+        if (!res.ok) throw new Error('bundle unavailable');
+        return res.json();
+      },
+      enabled: !!userId,
+    })),
+  });
+
+  let impressions = 0;
+  let clicks = 0;
+  for (const result of results) {
+    const k = (result.data as any)?.kpis;
+    impressions += Number(k?.impressions?.value ?? 0);
+    clicks += Number(k?.clicks?.value ?? 0);
+  }
+  return { impressions, clicks };
+}
+
 export default function DashboardPage() {
   const { userId } = useUser();
 
@@ -76,6 +107,8 @@ export default function DashboardPage() {
     },
     enabled: !!userId,
   });
+
+  const clickRate = useClickRate(clientApps, userId);
 
   const { data: campaigns = [] } = useQuery<Campaign[]>({
     queryKey: ['/api/campaigns', userId],
@@ -188,11 +221,10 @@ export default function DashboardPage() {
           iconBg="bg-[#3d8b7a]/10 dark:bg-white/10"
           iconColor="text-[#3d8b7a] dark:text-gray-300"
           value={0}
-          formattedValue="--"
-          label="Engagement Rate"
-          change={analyticsDeltas.engagementDelta}
-          suffix="%"
-          testId="stat-engagement-rate"
+          formattedValue={clickRate.impressions > 0 ? formatPct((clickRate.clicks / clickRate.impressions) * 100) : '--'}
+          label={clickRate.impressions > 0 ? `Click Rate · ${clickRate.clicks.toLocaleString()} clicks, 7d` : 'Click Rate · 7d'}
+          change={0}
+          testId="stat-click-rate"
         />
       </div>
 

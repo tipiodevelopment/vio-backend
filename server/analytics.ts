@@ -411,6 +411,9 @@ export function registerAnalyticsRoutes(app: Express) {
           startDate: cd.start_date,
           endDate: cd.end_date,
           isPaused: cd.is_paused,
+          // The collector is addressed per surface, so the commerce rates in the
+          // dashboard need the id, not just the name.
+          clientAppId: cd.client_app_id,
           clientAppName: cd.client_app_name,
           channelName: cd.channel_name,
           sponsorName: cd.sponsor_name,

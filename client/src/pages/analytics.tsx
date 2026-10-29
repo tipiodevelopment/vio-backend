@@ -1,6 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { AppLayout } from '@/components/AppLayout';
+import { MIN_RATE_BASE, perSession, rateOf, subtitle } from '@/lib/rates';
+import { RateCard } from '@/components/rate-card';
 import { useUser } from '@/contexts/UserContext';
 import { Skeleton } from '@/components/ui/skeleton';
 import { Link } from 'wouter';
@@ -336,6 +338,9 @@ function VioCommerceSection({ appId }: { appId: number }) {
   const funnel: Array<{ name: string; events: number; sessions: number }> = data.funnel ?? [];
   const maxFunnel = Math.max(1, ...funnel.map((f) => f.events));
   const currency = k.gmv?.currency ?? '';
+  const sessions = k.sessions?.value ?? 0;
+  const clicks = k.clicks?.value ?? 0;
+  const purchases = k.purchases?.value ?? 0;
 
   return (
     <div className="bg-white dark:bg-[#141824] border border-gray-200 dark:border-white/10 rounded-lg p-5" data-testid="section-vio-commerce">
@@ -355,12 +360,18 @@ function VioCommerceSection({ appId }: { appId: number }) {
         </div>
       </div>
 
+      <div className="grid grid-cols-2 md:grid-cols-3 gap-4 mb-4">
+        <RateCard label="Click rate" value={clicks} base={k.impressions?.value} of="impressions" testId="rate-vio-ctr" />
+        <RateCard label="Clicks per reader" value={clicks} base={sessions} of="sessions" testId="rate-vio-clicks-session" />
+        <RateCard label="Conversion" value={purchases} base={sessions} of="sessions" testId="rate-vio-conversion" />
+      </div>
+
       <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
-        <StatCard label="Impressions" value={formatNum(k.impressions?.value ?? 0)} icon={Eye} sub={fmtDelta(k.impressions?.delta)} testId="stat-vio-impressions" />
-        <StatCard label="CTR" value={`${((k.ctr?.value ?? 0) * 100).toFixed(1)}%`} icon={MousePointerClick} sub={`${formatNum(k.clicks?.value ?? 0)} clicks`} testId="stat-vio-ctr" />
-        <StatCard label="Sessions" value={formatNum(k.sessions?.value ?? 0)} icon={Users} sub={fmtDelta(k.sessions?.delta)} testId="stat-vio-sessions" />
-        <StatCard label="Purchases" value={formatNum(k.purchases?.value ?? 0)} icon={ShoppingCart} sub={fmtDelta(k.purchases?.delta)} testId="stat-vio-purchases" />
-        <StatCard label="GMV" value={`${formatNum(k.gmv?.value ?? 0)}${currency ? ` ${currency}` : ''}`} icon={TrendingUp} sub={fmtDelta(k.gmv?.delta)} testId="stat-vio-gmv" />
+        <StatCard label="Impressions" value={formatNum(k.impressions?.value ?? 0)} icon={Eye} sub={subtitle(perSession(k.impressions?.value, sessions), fmtDelta(k.impressions?.delta))} testId="stat-vio-impressions" />
+        <StatCard label="CTR" value={`${((k.ctr?.value ?? 0) * 100).toFixed(1)}%`} icon={MousePointerClick} sub={subtitle(`${formatNum(clicks)} clicks`, rateOf(clicks, sessions, 'sessions'))} testId="stat-vio-ctr" />
+        <StatCard label="Sessions" value={formatNum(sessions)} icon={Users} sub={fmtDelta(k.sessions?.delta)} testId="stat-vio-sessions" />
+        <StatCard label="Purchases" value={formatNum(purchases)} icon={ShoppingCart} sub={subtitle(rateOf(purchases, sessions, 'sessions'), fmtDelta(k.purchases?.delta))} testId="stat-vio-purchases" />
+        <StatCard label="GMV" value={`${formatNum(k.gmv?.value ?? 0)}${currency ? ` ${currency}` : ''}`} icon={TrendingUp} sub={subtitle(purchases ? `${formatNum(Math.round((k.gmv?.value ?? 0) / purchases))} avg order` : undefined, fmtDelta(k.gmv?.delta))} testId="stat-vio-gmv" />
       </div>
 
       <div className="grid md:grid-cols-2 gap-6">
@@ -369,12 +380,24 @@ function VioCommerceSection({ appId }: { appId: number }) {
           <div className="space-y-2">
             {funnel.map((stage, i) => {
               const prevEvents = i > 0 ? funnel[i - 1].events : 0;
-              const rate = i > 0 && prevEvents > 0 ? ` · ${((stage.events / prevEvents) * 100).toFixed(0)}%` : '';
+              const rate = i > 0 && prevEvents > 0 ? `${((stage.events / prevEvents) * 100).toFixed(0)}%` : '';
+              const thin = prevEvents > 0 && prevEvents < MIN_RATE_BASE;
               return (
                 <div key={stage.name} data-testid={`funnel-stage-${stage.name}`}>
                   <div className="flex justify-between text-xs mb-1">
                     <span className="text-gray-600 dark:text-gray-300">{stage.name}</span>
-                    <span className="text-gray-400">{formatNum(stage.events)}{rate}</span>
+                    <span className="text-gray-400">
+                      {formatNum(stage.events)}
+                      {rate && (
+                        <span
+                          className={thin ? 'text-gray-300 dark:text-gray-600' : undefined}
+                          title={thin ? `Only ${formatNum(prevEvents)} events at the previous step — too few to read as a rate` : undefined}
+                          data-testid={`funnel-rate-${stage.name}`}
+                        >
+                          {` · ${rate}`}{thin ? ` (${stage.events}/${prevEvents})` : ''}
+                        </span>
+                      )}
+                    </span>
                   </div>
                   <div className="h-2 bg-gray-100 dark:bg-white/5 rounded">
                     <div className="h-2 bg-[#3d8b7a] rounded" style={{ width: `${(stage.events / maxFunnel) * 100}%` }} />
@@ -493,6 +516,39 @@ function VoteBar({ options }: { options: any[] }) {
   );
 }
 
+/**
+ * Commerce rates for one campaign, from the collector through the proxy. Renders nothing
+ * when the collector has no answer for this campaign, so campaigns without commerce — a
+ * poll, a contest — look exactly as they did before.
+ */
+function CampaignCommerceRates({ campaignId, clientAppId }: { campaignId: number; clientAppId: number | undefined }) {
+  const { userId } = useUser();
+  const { data } = useQuery<any>({
+    queryKey: ['/api/analytics/vio/campaigns/funnel', campaignId, clientAppId, userId],
+    queryFn: async () => {
+      const res = await fetch(`/api/analytics/vio/campaigns/${campaignId}/funnel?userId=${userId}&clientAppId=${clientAppId}`);
+      if (!res.ok) throw new Error('campaign funnel unavailable');
+      return res.json();
+    },
+    enabled: !!userId && !!clientAppId,
+  });
+
+  const f = data?.funnel;
+  if (!f || !Number(f.impressions)) return null;
+
+  return (
+    <div data-testid="section-campaign-commerce-rates">
+      <SectionHeader title="Commerce rates" />
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <RateCard label="Click rate" value={f.clicks} base={f.impressions} of="impressions" testId="rate-campaign-ctr" />
+        <RateCard label="Clicks per reader" value={f.clicks} base={f.sessions} of="sessions" testId="rate-campaign-clicks-session" />
+        <RateCard label="Cart rate" value={f.add_to_carts} base={f.clicks} of="clicks" testId="rate-campaign-cart" />
+        <RateCard label="Conversion" value={f.purchase_sessions} base={f.sessions} of="sessions" testId="rate-campaign-conversion" />
+      </div>
+    </div>
+  );
+}
+
 function CampaignAnalytics({ campaignId, onDrill, onBack }: { campaignId: number; onDrill: (view: DrillView) => void; onBack: () => void }) {
   const { data, isLoading, isError } = useQuery<any>({ queryKey: ['/api/analytics/campaigns', campaignId] });
   const chart = useChartTheme();
@@ -530,6 +586,8 @@ function CampaignAnalytics({ campaignId, onDrill, onBack }: { campaignId: number
           </div>
         </div>
       </div>
+
+      <CampaignCommerceRates campaignId={campaignId} clientAppId={c.clientAppId} />
 
       <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3" data-testid="section-campaign-kpis">
         <StatCard label="Broadcasts" value={data.kpis.broadcastCount} icon={Radio} testId="stat-campaign-broadcasts" />
